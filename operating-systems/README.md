@@ -1,7 +1,23 @@
 # p3
 
-This repository contains the implementation of a basic file system emulator with the following four functionalities: diskinfo, disklist, diskget, and diskput. All features have been implemented as described in the rubric, and they work as expected.
+### This project involves implementing a set of low-level utilities to interact with a simplified FAT (File Allocation Table) file system using C. It was completed as part of a university Operating Systems course (CSC360).
 
+### Key Features:
+diskinfo – Reads and prints metadata from the Super Block and FAT of a disk image (test.img)
+disklist – Lists the contents of the root or a specified subdirectory
+diskget – Extracts a file from the FAT-based disk image into the local Linux file system
+diskput – Copies a file from the local Linux file system into the FAT-based disk image
+
+### Learning Objectives:
+Understand the internal structure of a FAT file system (Super Block, FAT, Directory Entries)
+Work with binary data and file systems using memory-mapped I/O (mmap)
+Implement practical file system operations (read, list, extract, insert)
+Gain experience with bit-level data access and low-level system programming
+
+### Technologies Used:
+Language: C
+Tools: GCC, Makefile
+Concepts: Binary data manipulation, File I/O, Memory mapping, Filesystem structures
 # Compilation
 
 The repository contains a Makefile that compiles all programs without errors.

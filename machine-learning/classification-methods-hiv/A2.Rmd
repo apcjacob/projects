@@ -1,0 +1,359 @@
+---
+title: "Assignment 2"
+output:
+  word_document: default
+  html_document: default
+date: "2025-02-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# References: Sample R code for STAT 469 Assignment 1. University of Victoria.
+# Load required libraries
+library(MTPS)
+library(rpart)  # For Classification Tree
+library(glmnet) # For Elastic Net
+library(ggplot2)
+library(MASS)   # For LDA
+library(caret)  # For stratified sampling
+library(ROCR)   # For optimal cutoff calculation
+
+# Load the data
+library(MTPS)
+data(HIV)
+str(XX)
+str(YY)
+#setwd("~") 
+
+# Control parameters
+K <- 5  # Number of folds
+nexperiments <- 50  # Number of experiments
+
+# Binary drug resistance matrix yBin
+yBin <- as.matrix(YY)
+cutoffs <- c(2, 3, 3, 1.5, 1.5)  # Cutoff means 1 is non-resistant
+for (ii in 1:5) yBin[, ii] <- (10^yBin[, ii] < cutoffs[ii]) * 1
+
+# Stratify using the target variable and save all experiment fold indexes in "folds.idx"
+set.seed(0)
+folds.idx <- matrix(0, nrow(yBin), nexperiments)
+for (e in 1:nexperiments) {
+  folds.idx[, e] <- createFolds(yBin[, 1], k = K, list = FALSE)
+}
+folds.idx <- t(folds.idx)
+
+# Run all the experiments, collect metrics for named models
+XXdf <- as.data.frame(XX)
+metrics <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(metrics) <- c("Model", "Drug", "experiment", "tn", "fp", "fn", "tp")
+models <- c("GLM", "LDA", "Classification Tree", "Elastic Net")
+
+
+
+# Find the best alpha for Elastic Net before running experiments
+best_alpha <- 0.5
+
+
+# Main loop to perform cross-validation for each drug and repeat
+cat("Experiment:")
+for (e in 1:nexperiments) {
+  cat(" ", e)
+  for (c in colnames(yBin)) {
+    cMs <- matrix(0, length(models), 4, dimnames = list(c(models), c("tn", "fp", "fn", "tp")))
+    XXdf$resist <- yBin[, c]
+    experiment.passes <- TRUE
+
+    for (f in 1:K) {
+      test <- folds.idx[e, ] == f
+      train <- !test
+
+      # Logistic Regression Metrics
+      m <- glm(resist ~ ., data = XXdf, subset = train, family = "binomial", control = glm.control(maxit = 100))
+      if (m$converged) {
+        p <- predict(m, newdata = XXdf[test, ], type = "response")
+        cMs["GLM", ] <- cMs["GLM", ] + table(p > 0.5, yBin[test, c])
+      } else {
+        experiment.passes <- FALSE
+        break
+      }
+
+      # LDA model
+      m <- lda(resist ~ ., data = XXdf, subset = train)
+      p <- predict(m, XXdf[test, ])
+      cMs["LDA", ] <- cMs["LDA", ] + table(p$class, yBin[test, c])
+
+      # Classification Tree
+      tree_model <- rpart(resist ~ ., data = XXdf, subset = train, method = "class")
+      tree_pred <- predict(tree_model, newdata = XXdf[test, ], type = "class")
+      cMs["Classification Tree", ] <- cMs["Classification Tree", ] + table(tree_pred, yBin[test, c])
+
+      # Elastic Net (Use precomputed best_alpha)
+      if (length(unique(yBin[train, c])) > 1) {
+        elastic_net_model <- cv.glmnet(as.matrix(XXdf[train, ]), yBin[train, c], 
+                                       family = "binomial", alpha = best_alpha)
+        
+        # Use lambda.1se for better regularization instead of lambda.min
+        enet_probs <- predict(elastic_net_model, newx = as.matrix(XXdf[test, ]), 
+                              s = "lambda.1se", type = "response")
+        
+        # Compute optimal cutoff using Precision-Recall Balance
+        pred <- prediction(enet_probs, yBin[test, c])
+        prec_rec_perf <- performance(pred, "prec", "rec")
+
+        # Find the threshold that maximizes (precision + recall)
+        prec_vals <- prec_rec_perf@y.values[[1]]
+        rec_vals <- prec_rec_perf@x.values[[1]]
+
+        # Ensure valid precision and recall values exist
+        valid_indices <- which(!is.na(prec_vals) & !is.na(rec_vals))
+
+        if (length(valid_indices) > 0) {
+          optimal_index <- valid_indices[which.max(prec_vals[valid_indices] + rec_vals[valid_indices])]
+          optimal_cutoff <- prec_rec_perf@alpha.values[[1]][optimal_index]
+        } else {
+          optimal_cutoff <- 0.5  # Default to 0.5 if no valid threshold is found
+        }
+        
+        # Apply optimal cutoff
+        elastic_net_pred <- as.integer(enet_probs > optimal_cutoff)
+      
+        # Ensure table includes both 0 and 1 classes
+        pred_table <- table(factor(elastic_net_pred, levels = c(0, 1)), 
+                            factor(yBin[test, c], levels = c(0, 1)))
+        cMs["Elastic Net", ] <- cMs["Elastic Net", ] + pred_table
+      }
+
+
+    }
+
+    if (experiment.passes)
+      metrics <- rbind(metrics, t(sapply(models, function(x) c(x, c, e, cMs[x, ]), USE.NAMES = FALSE)))
+  }
+}
+
+
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+
+# Calculate MCR, Precision, Recall, and F1-score
+colnames(metrics) <- c("Model", "Drug", "experiment", "tn", "fp", "fn", "tp")
+metrics <- metrics[, !is.na(colnames(metrics))]
+
+for (i in 3:7) metrics[, i] <- as.integer(metrics[, i])
+
+fillmetrics <- function(metrics) {
+  metrics$mcr <- with(metrics, (fp + fn) / (tn + fp + fn + tp))
+  metrics$acc <- with(metrics, (tp + tn) / (tn + fp + fn + tp))
+  metrics$precision <- with(metrics, tp / (tp + fp))
+  metrics$recall <- with(metrics, tp / (tp + fn))
+  metrics$F1 <- with(metrics, 2 * tp / (2 * tp + fp + fn))
+  return(metrics)
+}
+
+
+# Aggregate the metrics for all drugs
+metrics.agg = aggregate(cbind(tn,fp,fn,tp) ~ Model + experiment, data=metrics, FUN=sum)
+metrics = fillmetrics(metrics)
+
+metrics.agg = fillmetrics(metrics.agg)
+write.csv(metrics.agg, "metrics-agg.csv")
+write.csv(metrics,"metrics.csv")
+
+# count total valid experiments for each drug
+drug.experiments = sapply(sort(colnames(yBin)), function(x) sum(metrics$Drug==x)/length(models), USE.NAMES = F)
+all.experiments = sum(drug.experiments)
+
+
+# Plots "BoxPlotsAll.pdf" with details combined drugs per model
+# Open a PDF device for BoxPlotsAll.pdf
+pdf(file = "BoxPlotsAll.pdf", width = 14, height = 10)
+# MCR
+boxplot(mcr ~ Model, data=metrics.agg,horizontal = F, 
+        col = pal, rev = FALSE, fixup = TRUE, cex.lab=1.5,
+        main = sprintf("Figure 5: MCR of all Models all Drugs (%d experiments)", all.experiments),
+        ylab = "Misclassification Rate", xlab = "Model")
+abline(h=seq(0.12, 0.18, 0.02), col = "gray", lty = "dotted")
+abline(v=seq(1, 55, 1.0), col = "gray", lty = "dotted")
+legend("bottomleft",sort(models),fill=pal,title="Model", inset = c(0.04,0.01), cex=cex.legd, ncol=ncol.legd)
+
+# Precision
+boxplot(precision ~ Model, data=metrics.agg,horizontal = F, 
+        col = pal, rev = FALSE, fixup = TRUE, cex.lab=1.5,
+        main = sprintf("Figure 6: Precision of all Models all Drugs (%d experiments)", all.experiments),
+        ylab = "Precision", xlab = "Model")
+abline(h=seq(0.76, 0.86, 0.02), col = "gray", lty = "dotted")
+abline(v=seq(1, 55, 1.0), col = "gray", lty = "dotted")
+legend("topleft",sort(models),fill=pal,title="Model", inset = c(0.04,0.01), cex=cex.legd, ncol=ncol.legd)
+
+# Recall
+boxplot(recall ~ Model, data=metrics.agg,horizontal = F, 
+        col = pal, rev = FALSE, fixup = TRUE, cex.lab=1.5,
+        main = sprintf("Figure 7: Recall of all Models all Drugs (%d experiments)", all.experiments),
+        ylab = "Recall", xlab = "Model")
+abline(h=seq(0.84, 0.94, 0.02), col = "gray", lty = "dotted")
+abline(v=seq(1, 55, 1.0), col = "gray", lty = "dotted")
+legend("bottomleft",sort(models),fill=pal,title="Model", inset = c(0.41,0.01), cex=cex.legd, ncol=ncol.legd)
+
+# F1-score
+boxplot(F1 ~ Model, data=metrics.agg,horizontal = F, 
+        col = pal, rev = FALSE, fixup = TRUE, cex.lab=1.5,
+        main = sprintf("Figure 8: F1-Score of all Models all Drugs (%d experiments)", all.experiments),
+        ylab = "F1-score", xlab = "Model")
+abline(h=seq(0.82, 0.89, 0.01), col = "gray", lty = "dotted")
+abline(v=seq(1, 55, 1.0), col = "gray", lty = "dotted")
+legend("topleft",sort(models),fill=pal,title="Model", inset = c(0.2,0.01), cex=cex.legd, ncol=ncol.legd)
+
+dev.off()
+
+# Wilcoxon Test comparing new methods with LDA
+compute_wilcoxon <- function(drug) {
+  # Filter metrics for the current drug
+  df <- metrics[metrics$Drug == drug, ]
+  
+  # Ensure the required columns exist
+  if (!all(c("Model", "F1") %in% colnames(df))) {
+    stop("Required columns (Model, F1) are missing in the metrics data frame.")
+  }
+  
+  # Extract F1 scores for LDA, Classification Tree, and Elastic Net
+  lda_f1 <- df$F1[df$Model == "LDA"]
+  tree_f1 <- df$F1[df$Model == "Classification Tree"]
+  enet_f1 <- df$F1[df$Model == "Elastic Net"]
+  
+  # Perform Wilcoxon tests with suppressed warnings
+  p_values <- c(
+    suppressWarnings(wilcox.test(lda_f1, tree_f1, paired = TRUE)$p.value),
+    suppressWarnings(wilcox.test(lda_f1, enet_f1, paired = TRUE)$p.value)
+  )
+  
+  return(p_values)
+}
+
+# Apply the function to each drug
+drugs <- unique(metrics$Drug)
+wilcox_results <- t(sapply(drugs, compute_wilcoxon))
+
+# Add column names
+colnames(wilcox_results) <- c("LDA vs Classification Tree", "LDA vs Elastic Net")
+library(data.table)
+# Print the results
+print(as.data.table(wilcox_results))
+write.csv(as.data.table(wilcox_results), "wilcox.csv", row.names = drugs)
+# Load data.table
+library(data.table)
+
+# Convert metrics to a data.table
+metrics_dt <- as.data.table(metrics)
+
+# Calculate average metrics per drug and model
+average_metrics <- metrics_dt[, .(
+  mcr = mean(mcr, na.rm = TRUE),
+  acc = mean(acc, na.rm = TRUE),
+  precision = mean(precision, na.rm = TRUE),
+  recall = mean(recall, na.rm = TRUE),
+  F1 = mean(F1, na.rm = TRUE)
+), by = .(Model)]
+
+# Save the results
+write.csv(average_metrics, "average_metrics.csv", row.names = FALSE)
+# Save results
+write.csv(metrics, "metrics_cleaned.csv")
+
+```
+
+
+
+
+```{r}
+# Open a PDF device for BoxPlotsDrugs.pdf
+pdf(file = "BoxPlotsDrugs.pdf", width = 14, height = 10)
+
+# Set up the color palette
+pal <- hcl.colors(length(models), palette = "viridis", alpha = 0.6)
+
+# Set up layout and graphical parameters
+layout(mat = matrix(1:1, 1, 1))
+par(las = 2, mar = c(6, 6, 2, 1), mgp = c(4.2, 1, 0))
+
+# Define labels and experiment counts dynamically
+drug_labels <- sort(unique(metrics$Drug))
+num_drugs <- length(drug_labels)
+num_models <- length(models)
+xlabel1 <- sprintf("Model grouped by Drug: %s", paste0(drug_labels, collapse = " "))
+
+# Calculate the number of experiments per drug
+drug_experiments <- sapply(drug_labels, function(x) sum(metrics$Drug == x) / num_models)
+
+# Function to create a boxplot for a given metric
+create_boxplot <- function(metric, title, ylab) {
+  boxplot(
+    as.formula(paste(metric, "~ Model + Drug")), 
+    data = metrics, 
+    horizontal = FALSE, 
+    names = rep(sort(models), num_drugs),  # Dynamically generate names
+    col = pal, 
+    rev = FALSE, 
+    fixup = TRUE, 
+    cex.lab = 1.5,
+    main = title,
+    ylab = ylab, 
+    xlab = xlabel1
+  )
+  
+  # Add vertical lines to separate drugs
+  abline(v = seq(0.5, num_models * num_drugs + 0.5, num_models), col = "green", lwd = 2)
+  
+  # Add horizontal grid lines
+  abline(h = seq(0.1, 0.25, 0.05), col = "gray", lty = "dotted")
+  
+  # Add drug labels at the bottom
+  text(
+    x = seq(num_models / 2 + 0.5, num_models * num_drugs, num_models),
+    y = 0.1, 
+    labels = drug_labels, 
+    cex = 1.2
+  )
+  
+  # Add the number of experiments for each drug
+  text(
+    x = seq(num_models / 2 + 0.5, num_models * num_drugs, num_models),
+    y = 0.085, 
+    labels = sprintf("%d experiments", drug_experiments), 
+    cex = 1.0
+  )
+  
+  # Add a legend for the models
+  legend(
+    "topleft", 
+    legend = sort(models), 
+    fill = pal, 
+    title = "Model", 
+    inset = c(0.04, 0.01), 
+    cex = 0.75, 
+    ncol = 3
+  )
+}
+
+# Create boxplots for each metric
+create_boxplot("mcr", "Figure 1: Misclassification Rate of all Models grouped by Drug name", "Misclassification Rate")
+create_boxplot("precision", "Figure 2: Precision of all Models grouped by Drug name", "Precision")
+create_boxplot("recall", "Figure 3: Recall of all Models grouped by Drug name", "Recall")
+create_boxplot("F1", "Figure 4: F1-score of all Models grouped by Drug name", "F1-score")
+
+# Close the PDF device
+dev.off()
+```
+

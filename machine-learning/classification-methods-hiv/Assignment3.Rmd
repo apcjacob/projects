@@ -1,0 +1,410 @@
+---
+title: "Assignment 3"
+output: html_document
+date: "2025-03-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Load Required Libraries
+```{r}
+library(MTPS)
+library(caret)
+library(MASS)
+library(tree)
+library(glmnet)
+library(randomForest)
+library(ggplot2)
+library(knitr)
+library(dplyr)
+library(tidyr)
+library(data.table)
+
+
+```
+
+# Data Preparation
+```{r}
+set.seed(0)
+data(HIV)
+
+# Convert continuous outcomes into binary
+cutoffs <- c(2,3,3,1.5,1.5)
+yBin <- as.matrix(YY)
+for (ii in 1:5) {
+  yBin[, ii] <- (10^yBin[, ii] < cutoffs[ii]) * 1
+}
+
+colnames(XX) <- make.names(colnames(XX))
+XX <- as.matrix(XX)
+
+
+numberOfRepeats <- 10
+numberOfFolds <- 5
+foldmatrix_list <- lapply(1:5, function(drug) {
+  createMultiFolds(yBin[, drug], k = numberOfFolds, times = numberOfRepeats)
+})
+```
+
+# Function to compute metrics
+```{r}
+# Performance Metric Function for LDA, Elastic Net, Random Forest, and MTPS
+compute_metrics <- function(actual, predicted) {
+  # Ensure actual and predicted are factors with the same levels
+  actual <- factor(actual, levels = c(0, 1))
+  predicted <- factor(predicted, levels = c(0, 1))
+  
+  # Compute confusion matrix components
+  confusion <- table(Predicted = predicted, Actual = actual)
+  tn <- confusion[1, 1]  # True Negatives
+  fp <- confusion[1, 2]  # False Positives
+  fn <- confusion[2, 1]  # False Negatives
+  tp <- confusion[2, 2]  # True Positives
+  
+  # Compute metrics
+  mcr <- (fp + fn) / (tn + fp + fn + tp)  # Misclassification Rate
+  precision <- tp / (tp + fp)  # Precision
+  recall <- tp / (tp + fn)  # Recall
+  f1_score <- 2 * (precision * recall) / (precision + recall)  # F1 Score
+  
+  # Return metrics as a list
+  list(
+    tn = tn,
+    fp = fp,
+    fn = fn,
+    tp = tp,
+    misclassification = mcr,
+    precision = precision,
+    recall = recall,
+    f1_score = f1_score
+  )
+}
+```
+
+
+# MTPS Performance Evaluation
+```{r}
+# MTPS Performance Evaluation
+mtps_results_df <- data.frame(
+  Repeat = integer(),
+  tn = numeric(),
+  fp = numeric(),
+  fn = numeric(),
+  tp = numeric(),
+  Misclassification = numeric(),
+  Precision = numeric(),
+  Recall = numeric(),
+  F1 = numeric(),
+  stringsAsFactors = FALSE
+)
+
+set.seed(42)  # Ensure reproducibility
+
+for (repeat_idx in 1:numberOfRepeats) {
+  cat("\nMTPS Iteration:", repeat_idx, "\n")
+  
+  tryCatch({
+    # Generate train/test split
+    training.id <- sample(seq_len(nrow(xmat.bin)), size = 0.8 * nrow(xmat.bin))
+    
+    x.train.bin <- xmat.bin[training.id, ]
+    x.test.bin  <- xmat.bin[-training.id, ]
+    y.train.bin <- ymat.bin[training.id, ]
+    y.test.bin  <- ymat.bin[-training.id, ]
+    
+    # Fit MTPS model
+    fit.mtps <- MTPS(xmat = x.train.bin, ymat = y.train.bin,
+                     family = "binomial",
+                     residual = TRUE,
+                     method.step1 = rpart1,
+                     method.step2 = lm1,
+                     resid.type = "pearson", resid.std = TRUE) 
+    
+    # Make predictions
+    pred.mtps <- predict(fit.mtps, x.test.bin)
+    
+    # Convert probabilities to binary labels
+    pred.mtps <- ifelse(pred.mtps > 0.5, 1, 0)
+    
+    # Compute performance metrics
+    metrics <- compute_metrics(y.test.bin, pred.mtps)
+
+    # Store results
+    mtps_results_df <- bind_rows(mtps_results_df, 
+                                 data.frame(
+                                   Repeat = repeat_idx,
+                                   tn = metrics$tn,
+                                   fp = metrics$fp,
+                                   fn = metrics$fn,
+                                   tp = metrics$tp,
+                                   Misclassification = metrics$misclassification, 
+                                   Precision = metrics$precision, 
+                                   Recall = metrics$recall, 
+                                   F1 = metrics$f1_score
+                                 ))
+    
+  }, error = function(e) {
+    cat("Error in iteration", repeat_idx, ":", e$message, "\n")
+    
+    # Append NA values if iteration fails
+    mtps_results_df <- bind_rows(mtps_results_df, 
+                                 data.frame(
+                                   Repeat = repeat_idx,
+                                   tn = NA,
+                                   fp = NA,
+                                   fn = NA,
+                                   tp = NA,
+                                   Misclassification = NA, 
+                                   Precision = NA, 
+                                   Recall = NA, 
+                                   F1 = NA
+                                 ))
+  })
+
+  # Debugging: Check if a new row was added
+  cat("Current rows in dataframe:", nrow(mtps_results_df), "\n")
+}
+
+
+# Display the first few rows as a table
+kable(mtps_results_df)
+
+
+```
+
+
+# Cross-Validation for Models
+```{r}
+cv_model <- function(model_type, drug) {
+  foldmatrix <- foldmatrix_list[[drug]]
+  results <- matrix(NA, nrow = numberOfRepeats, ncol = 9)
+  colnames(results) <- c("Repeat", "tn", "fp", "fn", "tp", "Misclassification", "Precision", "Recall", "F1")
+  
+  for (i in 1:numberOfRepeats) {
+    cat(" ", i)
+    train_idx <- foldmatrix[[i]]
+    test_idx <- setdiff(1:nrow(XX), train_idx)
+    train_x <- XX[train_idx, , drop = FALSE]
+    test_x <- XX[test_idx, , drop = FALSE]
+    train_y <- as.factor(yBin[train_idx, drug])
+    test_y <- as.factor(yBin[test_idx, drug])
+    
+    if (model_type == "lda") {
+      model <- lda(train_y ~ ., data = data.frame(train_x, train_y))
+      predictions <- predict(model, newdata = data.frame(test_x))$class
+    } else if (model_type == "elastic_net") {
+      cv_model <- cv.glmnet(train_x, train_y, family = "binomial", alpha = 0.5)
+      best_lambda <- cv_model$lambda.min
+      predictions <- predict(cv_model, newx = test_x, s = best_lambda, type = "response")
+      predictions <- ifelse(predictions > 0.5, 1, 0)
+    } else if (model_type == "random_forest") {
+      model <- randomForest(train_x, train_y)
+      predictions <- predict(model, test_x)
+    }
+    
+    predictions <- as.factor(predictions)
+    metrics <- compute_metrics(test_y, predictions)
+    results[i, ] <- c(i, metrics$tn, metrics$fp, metrics$fn, metrics$tp, 
+                      metrics$misclassification, metrics$precision, metrics$recall, metrics$f1_score)
+  }
+  return(results)
+}
+```
+
+# Run Models
+```{r}
+results_list <- list()
+for (drug in 1:5) {
+  cat(" ", colnames(yBin)[drug])
+  results_list[[drug]] <- list(
+    lda = cv_model("lda", drug),
+    elastic_net = cv_model("elastic_net", drug),
+    random_forest = cv_model("random_forest", drug),
+    mtps=mtps_results_df
+  )
+}
+```
+
+# Generate Plots
+```{r}
+
+# Initialize an empty data frame to store results
+results_df <- data.frame(
+  Model = character(),
+  Drug = character(),
+  Repeat = integer(),
+  tn = integer(),
+  fp = integer(),
+  fn = integer(),
+  tp = integer(),
+  Misclassification = numeric(),
+  Precision = numeric(),
+  Recall = numeric(),
+  F1 = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through results_list and extract data
+for (drug in 1:length(results_list)) {
+  drug_name <- colnames(yBin)[drug]
+  for (model in names(results_list[[drug]])) {
+    model_results <- results_list[[drug]][[model]]
+    for (i in 1:nrow(model_results)) {
+      results_df <- rbind(results_df, data.frame(
+        Model = model,
+        Drug = drug_name,
+        Repeat = model_results[i, "Repeat"],
+        tn = model_results[i, "tn"],
+        fp = model_results[i, "fp"],
+        fn = model_results[i, "fn"],
+        tp = model_results[i, "tp"],
+        Misclassification = model_results[i, "Misclassification"],
+        Precision = model_results[i, "Precision"],
+        Recall = model_results[i, "Recall"],
+        F1 = model_results[i, "F1"]
+      ))
+    }
+  }
+}
+
+# Display head of the results data frame
+print(head(results_df))
+
+# Define metrics for comparison
+metrics_to_plot <- c("Misclassification", "Precision", "Recall", "F1")
+
+# Open a PDF device for Model comparison by drug
+pdf(file = "Model_Comparison_ByDrugs.pdf", width = 10, height = 8)
+
+# Loop through each metric and create plots
+for (metric in metrics_to_plot) {
+  p <- ggplot(results_df, aes(x = Model, y = .data[[metric]], fill = Drug)) +
+    geom_boxplot() +
+    stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "white") +
+    theme_minimal() +
+    labs(
+      title = paste(metric, "Comparison Across Models (Grouped by Drug)"),
+      y = metric,
+      x = "Model"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  print(p)
+}
+
+# Close the PDF device
+dev.off()
+
+# Open a new PDF device for overall model comparison
+pdf(file = "Model_Comparison_Boxplots.pdf", width = 10, height = 8)
+
+# Generate boxplots across all drugs for each metric
+for (metric in metrics_to_plot) {
+  metric_data <- data.frame(
+    Model = rep(c("LDA", "Elastic Net", "Random Forest", "MTPS"), each = nrow(results_df) / 4),
+    Value = unlist(lapply(results_list, function(drug_res) {
+      c(
+        as.numeric(drug_res$lda[, metric]),
+        as.numeric(drug_res$elastic_net[, metric]),
+        as.numeric(drug_res$random_forest[, metric]),
+        as.numeric(drug_res$mtps[, metric])  # Include MTPS
+      )
+    }))
+  )
+  
+  # Generate boxplot for each metric across all drugs
+  p <- ggplot(metric_data, aes(x = Model, y = Value, fill = Model)) +
+    geom_boxplot() +
+    stat_summary(fun=mean, geom="point", shape=23, size=3, fill="white") + 
+    theme_minimal() +
+    labs(title = paste(metric, "Comparison Across Models"), y = metric) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  print(p)
+}
+
+# Close the second PDF device
+dev.off()
+
+
+```
+
+# Wilcoxon result
+```{r}
+
+# Define function to compute Wilcoxon test for a given drug
+compute_wilcoxon <- function(drug) {
+  # Filter F1 scores for the current drug
+  df <- results_df[results_df$Drug == drug, ]
+  
+  # Ensure required columns exist
+  if (!all(c("Model", "F1") %in% colnames(df))) {
+    stop("Required columns (Model, F1) are missing in the results_df data frame.")
+  }
+  
+  # Extract F1 scores for each model
+  lda_f1 <- df$F1[df$Model == "lda"]
+  enet_f1 <- df$F1[df$Model == "elastic_net"]
+  mtps_f1 <- df$F1[df$Model == "mtps"]
+  rf_f1 <- df$F1[df$Model == "random_forest"]
+  
+  # Perform Wilcoxon tests with suppressed warnings
+  p_values <- c(
+    suppressWarnings(wilcox.test(lda_f1, mtps_f1, paired = TRUE)$p.value),
+    suppressWarnings(wilcox.test(lda_f1, rf_f1, paired = TRUE)$p.value),
+    suppressWarnings(wilcox.test(enet_f1, mtps_f1, paired = TRUE)$p.value),
+    suppressWarnings(wilcox.test(enet_f1, rf_f1, paired = TRUE)$p.value)
+  )
+  
+  return(p_values)
+}
+
+# Apply the function to each drug
+drugs <- unique(results_df$Drug)
+wilcox_results <- t(sapply(drugs, compute_wilcoxon))
+
+# Add column names
+colnames(wilcox_results) <- c("LDA vs MTPS", "LDA vs Random Forest", 
+                              "Elastic Net vs MTPS", "Elastic Net vs Random Forest")
+
+# Convert to a data table and print results
+wilcox_results_dt <- as.data.table(wilcox_results)
+wilcox_results_dt[, Drug := drugs]
+
+# Print the results
+print(wilcox_results_dt)
+
+# Save results to CSV
+write.csv(as.data.table(wilcox_results), "wilcox.csv", row.names = drugs)
+
+```
+
+#Calculate Average of all metrics
+```{r}
+# Compute average metrics per model (ignoring drug-level details)
+average_metrics_df <- results_df %>%
+  group_by(Model) %>%
+  summarise(
+    Avg_tn = mean(tn, na.rm = TRUE),
+    Avg_fp = mean(fp, na.rm = TRUE),
+    Avg_fn = mean(fn, na.rm = TRUE),
+    Avg_tp = mean(tp, na.rm = TRUE),
+    Avg_Misclassification = mean(Misclassification, na.rm = TRUE),
+    Avg_Precision = mean(Precision, na.rm = TRUE),
+    Avg_Recall = mean(Recall, na.rm = TRUE),
+    Avg_F1 = mean(F1, na.rm = TRUE),
+    .groups = 'drop'  # Prevents unnecessary grouping in dplyr
+  )
+
+# Print the first few rows to verify
+print(head(average_metrics_df))
+
+# Save to CSV
+write.csv(average_metrics_df, "average_metrics_per_model.csv", row.names = FALSE)
+
+cat("Average metrics have been saved to 'average_metrics_per_model.csv'\n")
+
+```
+
+
